@@ -29,6 +29,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use subprocess::{Exec, ExitStatus};
 
 mod errors {
@@ -112,39 +113,44 @@ fn run(args: Vec<String>, end: Receiver<()>) -> Result<()> {
     let config: FileConfig = toml::from_str(&config_str)
         .chain_err(|| format!("Unable to parse config as required toml format: {}", config_str))?;
 
-    // set up the CPU pool
-    // needs * 2 + 1 because of each subprocess requires another force stopper future,
-    // and service poller requires another
-
-    let required_pool_count = config.cmds.len() * 2 + 1;
-    let pool = CpuPool::new(required_pool_count);
-
     let (txs, rxs): (Vec<_>, Vec<_>) = (0..config.cmds.len())
         .map(|_| mpsc::channel::<()>())
         .unzip();
 
     // maintain the loop to stop service in a separate thread
-    let _ = pool.spawn_fn(move || -> std::result::Result<(), ()> {
+    let _ = thread::spawn(move || {
         loop {
             if let Ok(_) = end.try_recv() {
-                for tx in txs.into_iter() {
-                    let _ = tx.send(());
+                for (idx, tx) in txs.into_iter().enumerate() {
+                    match tx.send(()) {
+                        Ok(_) => debug!("Sent into channel #{}", idx),
+                        Err(e) => error!("Error sending into channel #{}: {}", idx, e),
+                    }
                 }
 
+                debug!("Received service end message");
                 break;
             }
         }
-
-        Ok(())
     });
     
     // starts launching of processes
-    let res_futs: Vec<_> = rxs.into_iter()
+
+    // set up the CPU pool
+    // needs * 2 because of each subprocess requires another force stopper future,    
+    let required_pool_count = config.cmds.len() * 2;
+    let pool = CpuPool::new(required_pool_count);
+
+    let fut_threads: Vec<_> = rxs.into_iter().enumerate()
         .zip(config.cmds.iter().cloned())
-        .map(|(rx, process)| {
+        .map(|((idx, rx), process)| {
             // rx receiving for forced stop
             let rx_fut = pool.spawn_fn(move || {
-                let _ = rx.recv();
+                match rx.recv() {
+                    Ok(_) => debug!("Received from channel #{}", idx),
+                    Err(e) => error!("Error receiving from channel #{}: {}", idx, e),
+                }
+
                 Ok(ExitStatus::Undetermined)
             });
 
@@ -171,12 +177,28 @@ fn run(args: Vec<String>, end: Receiver<()>) -> Result<()> {
                 process_res
             });
 
-            (rx_fut, subprocess_fut)
+            thread::spawn(move || {
+                let win_res = rx_fut.select(subprocess_fut)
+                    .map(|(win_fut, _)| win_fut)
+                    .wait();
+
+                match win_res {
+                    Ok(ref exit_status) => info!("Process #{} exit status: {:?}", idx, exit_status),
+                    Err((ref e, _)) => error!("Process #{} error: {}", idx, e),
+                }
+
+                win_res
+            })
         })
+        // must collect first in order to force all the futures to be executed
+        .collect();
+    
+    let combined_res: std::result::Result<Vec<_>, _> = fut_threads.into_iter()
+        .map(|fut_thread| fut_thread.join())
         .collect();
 
-    for (rx_fut, subprocess_fut) in res_futs.into_iter() {
-        let _ = rx_fut.select(subprocess_fut).map(|(win_fut, _)| win_fut);
+    if let Err(e) = combined_res {
+        error!("Error combining threads: {:?}", e);
     }
 
     Ok(())

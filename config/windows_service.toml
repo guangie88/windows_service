@@ -1,3 +1,4 @@
 cmds = [
-    "D:/comm_service/comm_service.exe -l D:/comm_service/config/comm_service_log.yml -n comm_service -p 17386",
+    "D:/comm_service/comm_service.exe -l D:/comm_service/config/comm_service_log.yml -n comm_service -p 17385",
+    "//hikari/share/Share/comm_service/comm_service.exe -l //hikari/share/Share/comm_service/config/comm_service_log.yml -n comm_service -p 17386",
 ]
