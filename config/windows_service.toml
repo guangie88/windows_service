@@ -1,0 +1,3 @@
+cmds = [
+    "D:/comm_service/comm_service.exe -l D:/comm_service/config/comm_service_log.yml -n comm_service -p 17386",
+]

@@ -1,0 +1,16 @@
+[package]
+name = "windows_service"
+version = "0.1.0"
+authors = ["Chen Weiguang <chen.weiguang@gmail.com>"]
+
+[dependencies]
+error-chain = "0.10.0"
+futures = "0.1.13"
+futures-cpupool = "0.1.5"
+log = "0.3.7"
+log4rs = "0.7.0"
+serde = "1.0.2"
+serde_derive = "1.0.2"
+subprocess = "0.1.10"
+toml = "0.4"
+winservice = "0.1.1"
