@@ -12,7 +12,7 @@ extern crate log4rs;
 
 #[macro_use]
 extern crate serde_derive;
-extern crate subprocess;
+extern crate shared_child;
 extern crate toml;
 
 #[macro_use]
@@ -24,13 +24,15 @@ use log::LogLevelFilter;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config, Root};
 use log4rs::encode::pattern::PatternEncoder;
+use shared_child::SharedChild;
 use std::env;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::raw::{c_char, c_int, c_void};
+use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use subprocess::{Exec, ExitStatus};
 
 mod errors {
     error_chain! {
@@ -58,7 +60,7 @@ pub extern "system" fn WinMain(
     Service!("windows_service", service_main)
 }
 
-fn run(args: Vec<String>, end: Receiver<()>) -> Result<()> {
+fn run(_: Vec<String>, end: Receiver<()>) -> Result<()> {
     // set up the logging by using the same file name as 
     let exe_path = env::current_exe()
         .chain_err(|| "Unable to get current executable path")?;
@@ -92,15 +94,15 @@ fn run(args: Vec<String>, end: Receiver<()>) -> Result<()> {
     let _ = log4rs::init_config(log_config)
         .chain_err(|| "Unable to initialize from log configuration")?;
 
-    // main thread checking + configuration
-    if args.len() != 2 {
-        bail!("Invalid usage, expected: service <config path>");
-    }
-
-    let config_path = &args[1];
+    // similarly derive the configuration file path from the dir path
+    let config_path = {
+        let mut tmp_file_path = exe_dir_path.join(exe_file_stem);
+        tmp_file_path.set_extension("toml");
+        tmp_file_path
+    };
 
     let config_str = {
-        let mut config_file = File::open(config_path)
+        let mut config_file = File::open(&config_path)
             .chain_err(|| format!("Unable to open config file path at {:?}", config_path))?;
 
         let mut s = String::new();
@@ -143,42 +145,73 @@ fn run(args: Vec<String>, end: Receiver<()>) -> Result<()> {
 
     let fut_threads: Vec<_> = rxs.into_iter().enumerate()
         .zip(config.cmds.iter().cloned())
-        .map(|((idx, rx), process)| {
+        .map(|((idx, rx), cmd)| {
+            // create the command and shared between both sides of futures
+            let mut process = if cfg!(target_os = "windows") {
+                let mut process = Command::new("cmd");
+                process.args(&["/C", &cmd]);
+                process
+            } else {
+                let mut process = Command::new("sh");
+                process.args(&["-c", &cmd]);
+                process
+            };
+
+            let shared_child = SharedChild::spawn(&mut process).unwrap();
+                // .chain_err(|| "Unable to spawn shared child")?;
+
+            let child_arc = Arc::new(shared_child);
+            let child_arc_rx = child_arc.clone();
+
             // rx receiving for forced stop
-            let rx_fut = pool.spawn_fn(move || {
+            let rx_fut = pool.spawn_fn(move || -> Result<Option<ExitStatus>> {
                 match rx.recv() {
                     Ok(_) => debug!("Received from channel #{}", idx),
                     Err(e) => error!("Error receiving from channel #{}: {}", idx, e),
                 }
 
-                Ok(ExitStatus::Undetermined)
+                // terminate the process
+                if let Ok(None) = child_arc_rx.try_wait() {
+                    debug!("Killing process #{}", idx);
+
+                    let kill_res = child_arc_rx.kill();
+
+                    match kill_res {
+                        Ok(_) => info!("Killed process #{}", idx),
+                        Err(e) => error!("Error killing process #{}: {}", idx, e),
+                    } 
+                }
+
+                Ok(None)
             });
 
             // subprocess launch
-            let subprocess_fut = pool.spawn_fn(move || {
-                let process_str = process.clone();
+            let child_arc_process = child_arc.clone();
 
-                let process_run = move || -> Result<ExitStatus> {
+            let process_fut = pool.spawn_fn(move || {
+                let cmd_str = cmd.clone();
+
+                let process_run = move || {
                     // process thread body
-                    let exit_status = Exec::shell(process)
-                        .join()
+                    let exit_status = child_arc_process
+                        .wait()
                         .chain_err(|| format!("Unable to join shell process"))?;
 
-                    Ok(exit_status)
+                    Ok(Some(exit_status))
                 };
 
                 let process_res = process_run();
 
                 match process_res {
-                    Ok(ref exit_status) => info!("Shell terminated [{}], exit code: {:?}", process_str, exit_status),
-                    Err(ref e) => error!("Shell error [{}]: {}", process_str, e),
+                    Ok(ref exit_status) => info!("Shell terminated [{}], exit code: {:?}", cmd_str, exit_status),
+                    Err(ref e) => error!("Shell error [{}]: {}", cmd_str, e),
                 }
 
                 process_res
             });
 
             thread::spawn(move || {
-                let win_res = rx_fut.select(subprocess_fut)
+                let win_res = rx_fut.select(process_fut)
                     .map(|(win_fut, _)| win_fut)
                     .wait();
 
